@@ -137,18 +137,51 @@ def build_summary_chart_block(weeks, muscle_group_map):
 def generate_mesocycle_markdown(mesocycle_data: dict, source_filename: str, exercise_lookup: dict, frontmatter_template: str, muscle_group_map: dict) -> str:
     mesocycle_title = mesocycle_data['name'].replace(' ', '_')
     now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
-    # Build summary chart + table block
-    chart_summary = build_summary_chart_block(mesocycle_data.get("weeks", []), muscle_group_map)
+
     frontmatter = frontmatter_template.format(
         title=mesocycle_title,
         created=now,
         updated=now,
         source=source_filename
     )
-    content = frontmatter + "\n\n" + chart_summary + "\n---\n"
+
+    # Weekly exercise summary
+    exercise_weekly = defaultdict(lambda: defaultdict(int))
+    exercise_max_effort = defaultdict(lambda: {"weight": 0, "reps": 0})
+
+    for week_index, week in enumerate(mesocycle_data["weeks"], start=1):
+        for day in week["days"]:
+            for exercise in day["exercises"]:
+                ex_id = exercise["exerciseId"]
+                for s in exercise["sets"]:
+                    exercise_weekly[ex_id][week_index] += 1
+                    if isinstance(s["weight"], (int, float)) and s["weight"] > exercise_max_effort[ex_id]["weight"]:
+                        exercise_max_effort[ex_id] = {"weight": s["weight"], "reps": s["reps"]}
+
+    summary_lines = [
+        "## Exercise Summary",
+        "",
+        "| Exercise | " + " | ".join(f"W{w}" for w in range(1, len(mesocycle_data['weeks']) + 1)) + " | Total | Max Weight | Max Reps |",
+        "|" + "----------|" * (len(mesocycle_data['weeks']) + 4)
+    ]
+
+    for ex_id in exercise_weekly:
+        name = exercise_lookup.get(ex_id, {}).get("name", f"Exercise {ex_id}")
+        week_counts = [exercise_weekly[ex_id].get(w, 0) for w in range(1, len(mesocycle_data['weeks']) + 1)]
+        total = sum(week_counts)
+        max_wt = exercise_max_effort[ex_id]["weight"]
+        max_rp = exercise_max_effort[ex_id]["reps"]
+        summary_lines.append("| " + f"[[{name}]] | " + " | ".join(str(w) for w in week_counts) + f" | {total} | {max_wt} | {max_rp} |")
+
+    # Build summary chart + table block
+    chart_summary = build_summary_chart_block(mesocycle_data.get("weeks", []), muscle_group_map)
+
+    content = frontmatter + "\n\n" + "\n".join(summary_lines) + "\n\n" + chart_summary + "\n---\n"
+
     for week_index, week in enumerate(mesocycle_data["weeks"]):
         for training_day in week["days"]:
             content += format_training_day(training_day, week_index, exercise_lookup, muscle_group_map)
+
     return content
 
 def fetch_mesocycle_detail(api_key: str, headers: dict) -> dict | None:
@@ -179,12 +212,16 @@ def load_mesocycles(headers, index_path: Path | None):
     return meso_list
 
 def main():
-    parser = argparse.ArgumentParser(description="Convert RP Strength mesocycles to Obsidian-compatible Markdown.")
+    parser = argparse.ArgumentParser(
+        description="Convert RP Strength mesocycles to Obsidian-compatible Markdown.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
     parser.add_argument("--index", type=str, required=False, help="Path to mesocycle index JSON file (optional; will fetch from API if missing)")
     parser.add_argument("--headers", type=str, required=True, help="Path to a .txt file containing headers")
     parser.add_argument("--exercises", type=str, help="Path to the exercises definition JSON file")
     parser.add_argument("--frontmatter", type=str, default="frontmatter_template.md", help="Path to frontmatter template file")
     parser.add_argument("--muscle-groups", type=str, help="Path to optional muscle group mapping JSON file")
+    parser.add_argument("--save-json", action="store_true", help="If set, save the raw JSON for each mesocycle")
     args = parser.parse_args()
 
     # Validation of required inputs and files
@@ -242,8 +279,9 @@ def main():
 
         output_json = output_dir / f"{meso_data['name']}.json"
 
-        # Save raw JSON before writing Markdown file
-        save_json(meso_data, output_json)
+        # Save raw JSON before writing Markdown file if requested
+        if args.save_json:
+            save_json(meso_data, output_json)
 
         markdown = generate_mesocycle_markdown(meso_data, f"{key}.json", exercise_lookup, frontmatter_template, muscle_group_map)
         output_file = output_dir / f"{meso_data['name']}.md"
