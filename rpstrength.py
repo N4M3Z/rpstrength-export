@@ -1,3 +1,4 @@
+from __future__ import annotations
 import json
 import argparse
 from datetime import datetime, UTC
@@ -18,6 +19,28 @@ DEFAULT_MUSCLE_GROUP_MAP = [
     "[[Triceps]]", "[[Quads]]", "[[Hamstrings]]", "[[Glutes]]",
     "[[Calves]]", "[[Traps]]", "[[Forearms]]", "[[Abs]]"
 ]
+
+def summarize_exercises(meso_data, exercise_lookup):
+    from collections import defaultdict
+    exercise_weekly = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+    exercise_max_effort = defaultdict(lambda: {"weight": 0, "reps": 0})
+    day_exercise_map = defaultdict(list)
+
+    for week_index, week in enumerate(meso_data["weeks"], start=1):
+        for day in week["days"]:
+            label = day["label"]
+            for exercise in day["exercises"]:
+                ex_id = exercise["exerciseId"]
+                key = (label, ex_id)
+                for s in exercise["sets"]:
+                    if s["weight"] is not None:
+                        exercise_weekly[key][week_index]["sets"] += 1
+                        if s["weight"] > exercise_max_effort[key]["weight"]:
+                            exercise_max_effort[key] = {"weight": s["weight"], "reps": s["reps"]}
+                if ex_id not in day_exercise_map[label]:
+                    day_exercise_map[label].append(ex_id)
+
+    return exercise_weekly, exercise_max_effort, day_exercise_map
 
 def get_json(url: str, headers: dict) -> dict:
     headers.update({
@@ -145,38 +168,32 @@ def generate_mesocycle_markdown(mesocycle_data: dict, source_filename: str, exer
         source=source_filename
     )
 
-    # Weekly exercise summary
-    exercise_weekly = defaultdict(lambda: defaultdict(int))
-    exercise_max_effort = defaultdict(lambda: {"weight": 0, "reps": 0})
+    # Group by day label
+    exercise_weekly, exercise_max_effort, day_exercise_map = summarize_exercises(mesocycle_data, exercise_lookup)
 
-    for week_index, week in enumerate(mesocycle_data["weeks"], start=1):
-        for day in week["days"]:
-            for exercise in day["exercises"]:
-                ex_id = exercise["exerciseId"]
-                for s in exercise["sets"]:
-                    exercise_weekly[ex_id][week_index] += 1
-                    if isinstance(s["weight"], (int, float)) and s["weight"] > exercise_max_effort[ex_id]["weight"]:
-                        exercise_max_effort[ex_id] = {"weight": s["weight"], "reps": s["reps"]}
+    # Build table
+    week_labels = [f"W{w}" for w in range(1, len(mesocycle_data['weeks']) + 1)]
+    headers = ["Exercise"] + week_labels + ["Total", "Max Weight", "Max Reps"]
+    summary_lines = ["## Exercise Summary", "", "| " + " | ".join(headers) + " |", "|" + " | ".join(["---"] * len(headers)) + " |"]
 
-    summary_lines = [
-        "## Exercise Summary",
-        "",
-        "| Exercise | " + " | ".join(f"W{w}" for w in range(1, len(mesocycle_data['weeks']) + 1)) + " | Total | Max Weight | Max Reps |",
-        "|" + "----------|" * (len(mesocycle_data['weeks']) + 4)
-    ]
+    WEEKDAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    for day_label in WEEKDAY_ORDER:
+        if day_label not in day_exercise_map:
+            continue
+        summary_lines.append(f"| **{day_label}** " + " |" * (len(headers) - 1) + " |")
+        for ex_id in day_exercise_map[day_label]:
+            key = (day_label, ex_id)
+            weekly_counts = [exercise_weekly[key][w]["sets"] for w in range(1, len(mesocycle_data['weeks']) + 1)]
+            total_sets = sum(weekly_counts)
+            max_data = exercise_max_effort[key]
+            name = exercise_lookup.get(ex_id, {}).get("name", f"Exercise {ex_id}")
+            max_weight = max_data["weight"] if max_data["weight"] is not None else ""
+            max_reps = max_data["reps"] if max_data["reps"] is not None and max_data["reps"] >= 0 else ""
+            row = [f"[[{name}]]"] + [str(s) for s in weekly_counts] + [str(total_sets), str(max_weight), str(max_reps)]
+            summary_lines.append("| " + " | ".join(row) + " |")
 
-    for ex_id in exercise_weekly:
-        name = exercise_lookup.get(ex_id, {}).get("name", f"Exercise {ex_id}")
-        week_counts = [exercise_weekly[ex_id].get(w, 0) for w in range(1, len(mesocycle_data['weeks']) + 1)]
-        total = sum(week_counts)
-        max_wt = exercise_max_effort[ex_id]["weight"]
-        max_rp = exercise_max_effort[ex_id]["reps"]
-        summary_lines.append("| " + f"[[{name}]] | " + " | ".join(str(w) for w in week_counts) + f" | {total} | {max_wt} | {max_rp} |")
-
-    # Build summary chart + table block
     chart_summary = build_summary_chart_block(mesocycle_data.get("weeks", []), muscle_group_map)
-
-    content = frontmatter + "\n\n" + "\n".join(summary_lines) + "\n\n" + chart_summary + "\n---\n"
+    content = frontmatter + "\n\n" + "\n".join(summary_lines) + "\n\n" + chart_summary + "\n"
 
     for week_index, week in enumerate(mesocycle_data["weeks"]):
         for training_day in week["days"]:
@@ -210,6 +227,16 @@ def load_mesocycles(headers, index_path: Path | None):
     meso_list = get_json("https://training.rpstrength.com/api/training/mesocycles", headers)
     save_json(meso_list, CONF_DIR / "mesocycles.json")
     return meso_list
+
+def resolve_unique_filename(base_path: Path) -> Path:
+    if not base_path.exists():
+        return base_path
+    i = 2
+    while True:
+        candidate = base_path.with_name(f"{base_path.stem} ({i}){base_path.suffix}")
+        if not candidate.exists():
+            return candidate
+        i += 1
 
 def main():
     parser = argparse.ArgumentParser(
@@ -252,6 +279,9 @@ def main():
     output_dir = Path("output")
     output_dir.mkdir(exist_ok=True)
 
+    # Collect summary rows for all mesocycles
+    all_exercise_summary_rows = []
+
     print("Available mesocycles:")
     for i, meso in enumerate(meso_list):
         print(f"{i}: {meso.get('name', 'Unnamed')}")
@@ -277,19 +307,50 @@ def main():
         if not meso_data:
             continue
 
-        output_json = output_dir / f"{meso_data['name']}.json"
+        # Sanitize file base name
+        base_name = meso_data['name'].replace('/', '_').strip()
+        output_json = resolve_unique_filename(output_dir / f"{base_name}.json")
+        output_file = resolve_unique_filename(output_dir / f"{base_name}.md")
 
         # Save raw JSON before writing Markdown file if requested
         if args.save_json:
             save_json(meso_data, output_json)
 
+        # --- Begin summary collection for all_exercise_summary_rows ---
+        exercise_weekly, exercise_max_effort, day_exercise_map = summarize_exercises(meso_data, exercise_lookup)
+
+        for day_label in ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]:
+            if day_label not in day_exercise_map:
+                continue
+            for ex_id in day_exercise_map[day_label]:
+                key2 = (day_label, ex_id)
+                weekly_counts = [exercise_weekly[key2][w]["sets"] for w in range(1, len(meso_data["weeks"]) + 1)]
+                total_sets = sum(weekly_counts)
+                max_data = exercise_max_effort[key2]
+                name = exercise_lookup.get(ex_id, {}).get("name", f"Exercise {ex_id}")
+                all_exercise_summary_rows.append({
+                    "Mesocycle": output_file.stem,
+                    "Day": day_label,
+                    "Exercise": name,
+                    "Total Sets": total_sets,
+                    "Max Weight": max_data["weight"],
+                    "Max Reps": max_data["reps"] if max_data["reps"] is not None and max_data["reps"] >= 0 else "",
+                    **{f"Sets W{w}": weekly_counts[w - 1] for w in range(1, len(meso_data["weeks"]) + 1)}
+                })
+        # --- End summary collection for all_exercise_summary_rows ---
+
         markdown = generate_mesocycle_markdown(meso_data, f"{key}.json", exercise_lookup, frontmatter_template, muscle_group_map)
-        output_file = output_dir / f"{meso_data['name']}.md"
 
         with output_file.open("w", encoding="utf-8") as out:
             out.write(markdown)
 
         print(f"Saved {output_file}")
+
+    # After all mesocycles processed, save the all_exercise_summary_rows as CSV
+    if all_exercise_summary_rows:
+        import pandas as pd
+        df = pd.DataFrame(all_exercise_summary_rows)
+        df.to_csv(output_dir / "exercise_summary_all.csv", index=False)
 
 if __name__ == "__main__":
     main()
